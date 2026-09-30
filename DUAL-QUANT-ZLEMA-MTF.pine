@@ -1,0 +1,386 @@
+//@version=6
+indicator("Dual-Timeframe Quant Engine [HTF + LTF Mobile Ready]", shorttitle="DUAL-QUANT-MOBILE", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// =============================================================================
+// 1. INPUT PARAMETER
+// =============================================================================
+grp_htf     = "1. PENGATURAN HTF (MACRO POI)"
+htfTf       = input.timeframe("60", "Higher Timeframe", group=grp_htf)
+maType      = input.string("ZLEMA", "Algoritma MA", options=["ZLEMA", "ALMA"], group=grp_htf)
+maLength    = input.int(34, "Periode MA HTF", minval=1, group=grp_htf)
+almaOffset  = input.float(0.85, "ALMA Offset", step=0.05, group=grp_htf)
+almaSigma   = input.float(6.0, "ALMA Sigma", step=0.5, group=grp_htf)
+showHtfFvg  = input.bool(true, "Tampilkan FVG HTF", group=grp_htf)
+showHtfSnr  = input.bool(true, "Tampilkan SNR HTF", group=grp_htf)
+
+grp_ltf     = "2. PENGATURAN LTF LOKAL (ENTRY TRIGGER POI)"
+showLtfFvg  = input.bool(true, "Tampilkan FVG LTF", group=grp_ltf)
+showLtfSnr  = input.bool(true, "Tampilkan SNR LTF", group=grp_ltf)
+ltfSnrLeft  = input.int(7, "LTF Pivot Left", group=grp_ltf)
+ltfSnrRight = input.int(3, "LTF Pivot Right", group=grp_ltf)
+
+grp_colors  = "3. TEMA WARNA & TRANSPARANSI"
+htfBullClr  = input.color(color.new(#00E676, 25), "HTF Bull FVG (Terang)", group=grp_colors)
+htfBearClr  = input.color(color.new(#FF1744, 25), "HTF Bear FVG (Terang)", group=grp_colors)
+ltfBullClr  = input.color(color.new(#00B0FF, 35), "LTF Bull FVG (Biru)", group=grp_colors)
+ltfBearClr  = input.color(color.new(#FF9100, 35), "LTF Bear FVG (Oranye)", group=grp_colors)
+snrShadowClr= input.color(color.new(#787B86, 80), "SNR Shadow (Redup)", group=grp_colors)
+
+grp_filters = "4. QUANT QUALITY ENGINE & RISK"
+useRvol     = input.bool(true, "Aktifkan Filter RVOL", group=grp_filters)
+rvolThresh  = input.float(1.2, "Min. RVOL Spike", step=0.1, group=grp_filters)
+useMss      = input.bool(true, "Aktifkan Micro-MSS", group=grp_filters)
+minScore    = input.int(75, "Minimal Entry Score", minval=50, maxval=95, group=grp_filters)
+rrRatio     = input.float(2.0, "Risk:Reward (1:X)", step=0.1, group=grp_filters)
+
+grp_dash    = "5. PENGATURAN DASHBOARD"
+showDash    = input.bool(true, "Tampilkan Dashboard", group=grp_dash)
+dashPos     = input.string("Kanan Bawah", "Posisi Dashboard", options=["Kanan Atas", "Kanan Bawah", "Kiri Atas", "Kiri Bawah"], group=grp_dash)
+dashSize    = input.string("Sangat Kecil (Tiny)", "Ukuran Dashboard", options=["Sangat Kecil (Tiny)", "Kecil", "Normal", "Besar"], group=grp_dash)
+
+// =============================================================================
+// 2. STRUKTUR DATA
+// =============================================================================
+type Zone
+    box   bId
+    float top
+    float bot
+    bool  isBull
+    bool  isFvg
+    string tf
+    int   score
+    int   birthTime
+
+var zoneArray = array.new<Zone>()
+
+// =============================================================================
+// 3. KALKULASI HTF (NON-REPAINTING VIA HISTORICAL SHIFT [1])
+// =============================================================================
+calc_zlema(series float src, simple int len) =>
+    lag = math.floor((len - 1) / 2)
+    adj = 2.0 * src - src[lag]
+    ta.ema(adj, len)
+
+calc_alma(series float src, simple int len, simple float off, simple float sig) =>
+    ta.alma(src, len, off, sig)
+
+f_htf(simple string mType, simple int mLen, simple float aOff, simple float aSig) =>
+    hClose = close[1]
+    hAtr   = ta.atr(14)[1]
+    hMaRaw = mType == "ZLEMA" ? calc_zlema(close, mLen) : calc_alma(close, mLen, aOff, aSig)
+    hMa    = hMaRaw[1]
+    hMaUp  = hMaRaw[1] > hMaRaw[2]
+
+    // Evaluasi FVG HTF
+    fvgBull = low[1] > high[3] and (low[1] - high[3]) >= (hAtr * 0.25)
+    fvgBear = high[1] < low[3] and (low[3] - high[1]) >= (hAtr * 0.25)
+    float fTop = fvgBull ? low[1] : fvgBear ? low[3] : na
+    float fBot = fvgBull ? high[3] : fvgBear ? high[1] : na
+    int   fTime= (fvgBull or fvgBear) ? time[3] : na
+    float fGap = fvgBull ? (low[1] - high[3]) : fvgBear ? (low[3] - high[1]) : 0.0
+    int   fScr = math.min(99, math.round(60 + (fGap / math.max(hAtr, 0.0001)) * 25))
+
+    // Evaluasi Pivot SNR HTF
+    pHi = ta.pivothigh(high, 10, 5)[1]
+    pLo = ta.pivotlow(low, 10, 5)[1]
+    int phiT = not na(pHi) ? time[6] : na
+    int ploT = not na(pLo) ? time[6] : na
+
+    [hClose, hMa, hMaUp, fvgBull, fvgBear, fTop, fBot, fTime, fScr, pHi, phiT, pLo, ploT, hAtr]
+
+// Ambil data HTF Tuple tanpa sintaksis brackets di luar
+[htf_close, htf_ma, htf_ma_up, htf_fvg_bull, htf_fvg_bear, htf_fvg_top, htf_fvg_bot, htf_fvg_t, htf_fvg_score, htf_phi, htf_phi_t, htf_plo, htf_plo_t, htf_atr] = 
+     request.security(syminfo.tickerid, htfTf, f_htf(maType, maLength, almaOffset, almaSigma), lookahead=barmerge.lookahead_off)
+
+// Render Garis HTF MA
+plot(htf_ma, "HTF Baseline MA", color=htf_ma_up ? #00E676 : #FF1744, linewidth=2)
+
+// =============================================================================
+// 4. DAFTAR OBJEK HTF & LTF (DENGAN PRE-VALIDATION)
+// =============================================================================
+var int lastHtfFvgTime = 0
+var int lastHtfPhiTime = 0
+var int lastHtfPloTime = 0
+var int lastLtfPhiTime = 0
+var int lastLtfPloTime = 0
+
+stepTime = bar_index > 1 ? int(time - time[1]) : 60000
+extTime  = time + (stepTime * 15)
+ltfAtr   = ta.atr(14)
+htfAtrVal= nz(htf_atr, ltfAtr)
+
+tfHtfLabel = htfTf == "60" ? "H1" : htfTf == "240" ? "H4" : "M" + htfTf
+tfLtfLabel = "M" + timeframe.period
+
+// A. Pendaftaran FVG HTF (Hanya jika belum tertembus pada bar saat ini)
+if showHtfFvg and not na(htf_fvg_t) and int(htf_fvg_t) != lastHtfFvgTime
+    int tVal = int(htf_fvg_t)
+    if htf_fvg_bull and low > htf_fvg_bot
+        string txt = "[" + tfHtfLabel + "] FVG Bull | Scr: " + str.tostring(htf_fvg_score)
+        b = box.new(left=tVal, top=htf_fvg_top, right=extTime, bottom=htf_fvg_bot, xloc=xloc.bar_time, 
+                    border_color=color.new(htfBullClr, 0), bgcolor=htfBullClr,
+                    text=txt, text_color=color.white, text_size=size.small, text_halign=text.align_left)
+        array.push(zoneArray, Zone.new(b, htf_fvg_top, htf_fvg_bot, true, true, tfHtfLabel, htf_fvg_score, tVal))
+        lastHtfFvgTime := tVal
+    else if htf_fvg_bear and high < htf_fvg_top
+        string txt = "[" + tfHtfLabel + "] FVG Bear | Scr: " + str.tostring(htf_fvg_score)
+        b = box.new(left=tVal, top=htf_fvg_top, right=extTime, bottom=htf_fvg_bot, xloc=xloc.bar_time, 
+                    border_color=color.new(htfBearClr, 0), bgcolor=htfBearClr,
+                    text=txt, text_color=color.white, text_size=size.small, text_halign=text.align_left)
+        array.push(zoneArray, Zone.new(b, htf_fvg_top, htf_fvg_bot, false, true, tfHtfLabel, htf_fvg_score, tVal))
+        lastHtfFvgTime := tVal
+
+// B. Pendaftaran SNR HTF
+htfSnrHeight = htfAtrVal * 0.15
+if showHtfSnr
+    if not na(htf_phi) and not na(htf_phi_t) and int(htf_phi_t) != lastHtfPhiTime and close < htf_phi
+        int tVal = int(htf_phi_t)
+        string txt = "[" + tfHtfLabel + "] SNR Res"
+        b = box.new(left=tVal, top=htf_phi, right=extTime, bottom=htf_phi - htfSnrHeight, xloc=xloc.bar_time, 
+                    border_color=color.new(snrShadowClr, 40), bgcolor=snrShadowClr,
+                    text=txt, text_color=color.new(color.white, 30), text_size=size.small, text_halign=text.align_left)
+        array.push(zoneArray, Zone.new(b, htf_phi, htf_phi - htfSnrHeight, false, false, tfHtfLabel, 75, tVal))
+        lastHtfPhiTime := tVal
+
+    if not na(htf_plo) and not na(htf_plo_t) and int(htf_plo_t) != lastHtfPloTime and close > htf_plo
+        int tVal = int(htf_plo_t)
+        string txt = "[" + tfHtfLabel + "] SNR Sup"
+        b = box.new(left=tVal, top=htf_plo + htfSnrHeight, right=extTime, bottom=htf_plo, xloc=xloc.bar_time, 
+                    border_color=color.new(snrShadowClr, 40), bgcolor=snrShadowClr,
+                    text=txt, text_color=color.new(color.white, 30), text_size=size.small, text_halign=text.align_left)
+        array.push(zoneArray, Zone.new(b, htf_plo + htfSnrHeight, htf_plo, true, false, tfHtfLabel, 75, tVal))
+        lastHtfPloTime := tVal
+
+// C. Pendaftaran FVG LTF LOKAL
+if showLtfFvg and bar_index > 3
+    ltfBullFvg = low > high[2] and (low - high[2]) >= (ltfAtr * 0.3)
+    ltfBearFvg = high < low[2] and (low[2] - high) >= (ltfAtr * 0.3)
+    
+    if ltfBullFvg
+        float gap = low - high[2]
+        int scr = math.min(95, math.round(55 + (gap / ltfAtr) * 20))
+        string txt = "[" + tfLtfLabel + "] FVG Bull | Scr: " + str.tostring(scr)
+        b = box.new(left=time[2], top=low, right=extTime, bottom=high[2], xloc=xloc.bar_time, 
+                    border_color=color.new(ltfBullClr, 10), bgcolor=ltfBullClr,
+                    text=txt, text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        array.push(zoneArray, Zone.new(b, low, high[2], true, true, tfLtfLabel, scr, time[2]))
+        
+    if ltfBearFvg
+        float gap = low[2] - high
+        int scr = math.min(95, math.round(55 + (gap / ltfAtr) * 20))
+        string txt = "[" + tfLtfLabel + "] FVG Bear | Scr: " + str.tostring(scr)
+        b = box.new(left=time[2], top=low[2], right=extTime, bottom=high, xloc=xloc.bar_time, 
+                    border_color=color.new(ltfBearClr, 10), bgcolor=ltfBearClr,
+                    text=txt, text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        array.push(zoneArray, Zone.new(b, low[2], high, false, true, tfLtfLabel, scr, time[2]))
+
+// D. Pendaftaran SNR LTF LOKAL
+ltfSnrHeight = ltfAtr * 0.2
+if showLtfSnr
+    ltfPhi = ta.pivothigh(high, ltfSnrLeft, ltfSnrRight)
+    ltfPlo = ta.pivotlow(low, ltfSnrLeft, ltfSnrRight)
+    
+    if not na(ltfPhi) and time[ltfSnrRight] != lastLtfPhiTime
+        int tVal = time[ltfSnrRight]
+        string txt = "[" + tfLtfLabel + "] SNR Res"
+        b = box.new(left=tVal, top=ltfPhi, right=extTime, bottom=ltfPhi - ltfSnrHeight, xloc=xloc.bar_time, 
+                    border_color=color.new(#9C27B0, 50), bgcolor=color.new(#9C27B0, 85),
+                    text=txt, text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        array.push(zoneArray, Zone.new(b, ltfPhi, ltfPhi - ltfSnrHeight, false, false, tfLtfLabel, 65, tVal))
+        lastLtfPhiTime := tVal
+
+    if not na(ltfPlo) and time[ltfSnrRight] != lastLtfPloTime
+        int tVal = time[ltfSnrRight]
+        string txt = "[" + tfLtfLabel + "] SNR Sup"
+        b = box.new(left=tVal, top=ltfPlo + ltfSnrHeight, right=extTime, bottom=ltfPlo, xloc=xloc.bar_time, 
+                    border_color=color.new(#009688, 50), bgcolor=color.new(#009688, 85),
+                    text=txt, text_color=color.white, text_size=size.tiny, text_halign=text.align_left)
+        array.push(zoneArray, Zone.new(b, ltfPlo + ltfSnrHeight, ltfPlo, true, false, tfLtfLabel, 65, tVal))
+        lastLtfPloTime := tVal
+
+// =============================================================================
+// 5. LIFECYCLE & STRICT MITIGATION ENGINE (PENGHAPUSAN OBJEK REAL-TIME)
+// =============================================================================
+if array.size(zoneArray) > 0
+    for i = array.size(zoneArray) - 1 to 0
+        z = array.get(zoneArray, i)
+        bool kill = false
+
+        if z.isFvg
+            // Mitigasi FVG: Full-fill atau Candle Close melanggar batas
+            if z.isBull and (low <= z.bot or close < z.bot)
+                kill := true
+            else if not z.isBull and (high >= z.top or close > z.top)
+                kill := true
+        else
+            // Mitigasi SNR: Clean Close Breakout
+            if z.isBull and close < z.bot
+                kill := true
+            else if not z.isBull and close > z.top
+                kill := true
+
+        if kill
+            box.delete(z.bId)
+            array.remove(zoneArray, i)
+        else
+            box.set_right(z.bId, extTime)
+
+// Batas alokasi memori TradingView
+if array.size(zoneArray) > 50
+    old = array.shift(zoneArray)
+    box.delete(old.bId)
+
+// =============================================================================
+// 6. SYARAT ENTRY PRESISI (CONFLUENCE ENGINE)
+// =============================================================================
+volMa = ta.sma(volume, 20)
+rvol  = volMa > 0 ? (volume / volMa) : 1.0
+
+bool inHtfDemand = false
+bool inHtfSupply = false
+bool inLtfDemand = false
+bool inLtfSupply = false
+float targetZoneLevel = na
+
+if array.size(zoneArray) > 0
+    for i = 0 to array.size(zoneArray) - 1
+        z = array.get(zoneArray, i)
+        if low <= z.top and high >= z.bot
+            if z.isBull
+                if z.tf == tfHtfLabel
+                    inHtfDemand := true
+                else
+                    inLtfDemand := true
+                targetZoneLevel := z.bot
+            else
+                if z.tf == tfHtfLabel
+                    inHtfSupply := true
+                else
+                    inLtfSupply := true
+                targetZoneLevel := z.top
+
+cRange    = high - low
+cBody     = math.abs(close - open)
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+bullRejection = cRange > 0 and (lowerWick / cRange >= 0.35)
+bearRejection = cRange > 0 and (upperWick / cRange >= 0.35)
+
+rvolPass    = not useRvol or (rvol >= rvolThresh)
+mssBullPass = not useMss or (cBody / cRange >= 0.45 and close > open and close > high[1])
+mssBearPass = not useMss or (cBody / cRange >= 0.45 and close < open and close < low[1])
+
+// =============================================================================
+// 7. PENILAIAN SKOR & TRIGGER FINAL
+// =============================================================================
+int bScore = 0
+int sScore = 0
+
+// Evaluasi BUY
+if close > htf_ma and htf_ma_up
+    bScore += 25
+if inHtfDemand
+    bScore += 25
+if inLtfDemand
+    bScore += 15
+if bullRejection or (close > open and close > high[1])
+    bScore += 15
+if rvolPass
+    bScore += 10
+if mssBullPass
+    bScore += 10
+
+// Evaluasi SELL
+if close < htf_ma and not htf_ma_up
+    sScore += 25
+if inHtfSupply
+    sScore += 25
+if inLtfSupply
+    sScore += 15
+if bearRejection or (close < open and close < low[1])
+    sScore += 15
+if rvolPass
+    sScore += 10
+if mssBearPass
+    sScore += 10
+
+bool buyCond  = (bScore >= minScore) and (inHtfDemand or inLtfDemand) and rvolPass and mssBullPass and (close > htf_ma)
+bool sellCond = (sScore >= minScore) and (inHtfSupply or inLtfSupply) and rvolPass and mssBearPass and (close < htf_ma)
+
+var int lastSignalIdx = 0
+fireBuy  = buyCond and (bar_index - lastSignalIdx > 3)
+fireSell = sellCond and (bar_index - lastSignalIdx > 3)
+
+if fireBuy or fireSell
+    lastSignalIdx := bar_index
+
+// Label Entry dan Garis Target SL/TP
+if fireBuy
+    float sl = math.min(low, nz(targetZoneLevel, low)) - (ltfAtr * 0.5)
+    float tp = close + (close - sl) * rrRatio
+    string gr = bScore >= 85 ? "A+" : "A"
+    label.new(bar_index, low, "BUY [" + str.tostring(bScore) + " | " + gr + "]\nSL: " + str.tostring(sl, "#.##") + "\nTP: " + str.tostring(tp, "#.##"), 
+              color=#00E676, textcolor=color.black, style=label.style_label_up, size=size.normal)
+    line.new(bar_index, sl, bar_index + 10, sl, color=color.red, width=2)
+    line.new(bar_index, tp, bar_index + 10, tp, color=color.green, width=2)
+
+if fireSell
+    float sl = math.max(high, nz(targetZoneLevel, high)) + (ltfAtr * 0.5)
+    float tp = close - (sl - close) * rrRatio
+    string gr = sScore >= 85 ? "A+" : "A"
+    label.new(bar_index, high, "SELL [" + str.tostring(sScore) + " | " + gr + "]\nSL: " + str.tostring(sl, "#.##") + "\nTP: " + str.tostring(tp, "#.##"), 
+              color=#FF1744, textcolor=color.white, style=label.style_label_down, size=size.normal)
+    line.new(bar_index, sl, bar_index + 10, sl, color=color.red, width=2)
+    line.new(bar_index, tp, bar_index + 10, tp, color=color.green, width=2)
+
+// =============================================================================
+// 8. DASHBOARD MONITOR (DUKUNGAN PENUH SIZE TINY)
+// =============================================================================
+var string tPos = position.bottom_right
+if dashPos == "Kanan Atas"
+    tPos := position.top_right
+else if dashPos == "Kiri Atas"
+    tPos := position.top_left
+else if dashPos == "Kiri Bawah"
+    tPos := position.bottom_left
+
+// Mapping ukuran font dashboard
+var string tSz = size.tiny
+if dashSize == "Sangat Kecil (Tiny)"
+    tSz := size.tiny
+else if dashSize == "Kecil"
+    tSz := size.small
+else if dashSize == "Besar"
+    tSz := size.large
+else
+    tSz := size.normal
+
+var table db = table.new(tPos, 2, 7, bgcolor=color.new(#131722, 10), border_width=1, border_color=color.new(color.gray, 60))
+
+if showDash and barstate.islast
+    table.cell(db, 0, 0, "SYSTEM DUAL-TF", text_color=color.white, text_size=tSz, bgcolor=color.new(color.black, 10))
+    table.cell(db, 1, 0, "METRIK STATUS", text_color=color.white, text_size=tSz, bgcolor=color.new(color.black, 10))
+
+    table.cell(db, 0, 1, "Matrix Mode", text_color=color.white, text_size=tSz)
+    table.cell(db, 1, 1, "HTF: " + tfHtfLabel + " | LTF: " + tfLtfLabel, text_color=color.yellow, text_size=tSz)
+
+    table.cell(db, 0, 2, "HTF Trend Bias", text_color=color.white, text_size=tSz)
+    table.cell(db, 1, 2, htf_ma_up ? "BULLISH" : "BEARISH", text_color=htf_ma_up ? #00E676 : #FF1744, text_size=tSz)
+
+    table.cell(db, 0, 3, "RVOL Exp", text_color=color.white, text_size=tSz)
+    table.cell(db, 1, 3, str.tostring(rvol, "#.##") + "x", text_color=rvol >= rvolThresh ? #00E676 : color.gray, text_size=tSz)
+
+    table.cell(db, 0, 4, "Interaksi Zona", text_color=color.white, text_size=tSz)
+    string interStr = (inHtfSupply or inLtfSupply) ? "AT SUPPLY / RES" : (inHtfDemand or inLtfDemand) ? "AT DEMAND / SUP" : "OPEN LIQUIDITY"
+    color interClr = (inHtfSupply or inLtfSupply) ? #FF1744 : (inHtfDemand or inLtfDemand) ? #00E676 : color.gray
+    table.cell(db, 1, 4, interStr, text_color=interClr, text_size=tSz)
+
+    int curScore = (inHtfDemand or inLtfDemand) ? bScore : (inHtfSupply or inLtfSupply) ? sScore : 0
+    table.cell(db, 0, 5, "Live Score", text_color=color.white, text_size=tSz)
+    table.cell(db, 1, 5, str.tostring(curScore) + " / 100", text_color=curScore >= minScore ? #00E676 : color.orange, text_size=tSz)
+
+    string actStr = fireBuy ? "EXECUTE BUY" : fireSell ? "EXECUTE SELL" : "WAITING SETUP"
+    color actClr  = fireBuy ? #00E676 : fireSell ? #FF1744 : color.gray
+    table.cell(db, 0, 6, "Sinyal Tindakan", text_color=color.white, text_size=tSz)
+    table.cell(db, 1, 6, actStr, text_color=actClr, text_size=tSz)
